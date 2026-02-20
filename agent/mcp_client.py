@@ -90,7 +90,7 @@ class MCPClient:
         return response
 
     def get_openai_tools_schema(self) -> list[dict]:
-        """Convert MCP tools to OpenAI function-calling schema."""
+        """Convert MCP tools to OpenAI Responses API function tool schema."""
         if not self._tools_cache:
             raise RuntimeError("Call list_tools() first")
 
@@ -98,11 +98,9 @@ class MCPClient:
         for tool in self._tools_cache:
             openai_tools.append({
                 "type": "function",
-                "function": {
-                    "name": tool["name"],
-                    "description": tool["description"],
-                    "parameters": tool["input_schema"],
-                },
+                "name": tool["name"],
+                "description": tool["description"],
+                "parameters": tool["input_schema"],
             })
         return openai_tools
 
