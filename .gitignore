@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.local
+.DS_Store
+mcp-server/node_modules/
+mcp-server/dist/
+agent/__pycache__/
+agent/.venv/
