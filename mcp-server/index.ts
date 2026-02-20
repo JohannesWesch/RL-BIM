@@ -32,21 +32,19 @@ function img(result: any) {
     return { content: extractImage(result) };
 }
 
-server.tool("list_elements", "List all elements in the model with Express ID, type, and name.",
-    { ifc_type: z.string().optional().describe("Filter by IFC type, e.g. 'IfcWall'") },
-    async ({ ifc_type }) => text(await bridge.call("search_elements", { query: "", ifc_type })));
 
-server.tool("search_elements", "Search elements by name. Returns matching Express IDs, types, and names.",
-    { query: z.string().describe("Text to match against element names") },
-    async ({ query }) => text(await bridge.call("search_elements", { query })));
 
-server.tool("mark_element", "Highlight an element and zoom out so it is centered and fully visible. Returns screenshot.",
-    { express_id: z.number().describe("Express ID from list_elements or search_elements") },
-    async ({ express_id }) => img(await bridge.call("mark_element", { express_id })));
+server.tool("camera_orbit", "Orbit the camera around the current target. Returns a 16-frame sprite sheet of recent views.",
+    { direction: z.enum(["left", "right", "up", "down"]).describe("Direction to orbit") },
+    async ({ direction }) => img(await bridge.call("camera_orbit", { direction })));
 
-server.tool("get_element_properties", "Get full IFC properties for a marked/found element.",
-    { express_id: z.number().describe("Express ID") },
-    async ({ express_id }) => text(await bridge.call("get_element_properties", { express_id })));
+server.tool("camera_zoom", "Dolly/Zoom the camera in or out by a small amount. Returns a 16-frame sprite sheet of recent views.",
+    { direction: z.enum(["in", "out"]).describe("Zoom in or out") },
+    async ({ direction }) => img(await bridge.call("camera_zoom", { direction })));
+
+server.tool("camera_walk", "Walk the camera 1 meter in a given direction (FPS style). Returns a 16-frame sprite sheet of recent views.",
+    { direction: z.enum(["forward", "backward", "left", "right"]).describe("Direction to walk") },
+    async ({ direction }) => img(await bridge.call("camera_walk", { direction })));
 
 async function main() {
     await bridge.start();
