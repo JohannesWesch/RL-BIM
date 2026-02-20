@@ -34,17 +34,20 @@ function img(result: any) {
 
 
 
-server.tool("camera_orbit", "Orbit the camera around the current target. Returns a 16-frame sprite sheet of recent views.",
-    { direction: z.enum(["left", "right", "up", "down"]).describe("Direction to orbit") },
-    async ({ direction }) => img(await bridge.call("camera_orbit", { direction })));
+server.tool("camera_look", "Pan or tilt the view (turn your head) in a specific direction.",
+    { direction: z.enum(["left", "right", "up", "down"]).describe("Direction to look") },
+    async ({ direction }) => img(await bridge.call("camera_look", { direction })));
 
-server.tool("camera_zoom", "Dolly/Zoom the camera in or out by a small amount. Returns a 16-frame sprite sheet of recent views.",
-    { direction: z.enum(["in", "out"]).describe("Zoom in or out") },
-    async ({ direction }) => img(await bridge.call("camera_zoom", { direction })));
+server.tool("camera_walk", "Walk the camera by a specific number of steps (1 meter per step) in a given direction (FPS style). Returns a 16-frame sprite sheet of recent views.",
+    {
+        direction: z.enum(["forward", "backward", "left", "right"]).describe("Direction to walk"),
+        steps: z.number().optional().describe("Number of 1-meter steps to walk before returning the image (default: 1, max: 10)")
+    },
+    async ({ direction, steps }) => img(await bridge.call("camera_walk", { direction, steps })));
 
-server.tool("camera_walk", "Walk the camera 1 meter in a given direction (FPS style). Returns a 16-frame sprite sheet of recent views.",
-    { direction: z.enum(["forward", "backward", "left", "right"]).describe("Direction to walk") },
-    async ({ direction }) => img(await bridge.call("camera_walk", { direction })));
+server.tool("capture_view", "Capture the current view of the model as a sprite sheet without moving the camera.",
+    {},
+    async () => img(await bridge.call("capture_view", {})));
 
 async function main() {
     await bridge.start();

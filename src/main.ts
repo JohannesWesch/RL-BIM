@@ -29,20 +29,22 @@ async function main() {
 
     // Auto-load model from ?model= query parameter
     const params = new URLSearchParams(window.location.search);
-    const modelUrl = params.get("model");
-    if (modelUrl) {
-        status.textContent = `Loading model: ${modelUrl}…`;
-        try {
-            const result = await viewer.loadModel(modelUrl);
-            status.textContent = `Model loaded: ${result.elementCount} elements`;
-            console.log("[RL-BIM] Model loaded:", result);
+    const modelUrl = params.get("model") || "/sample.ifc";
 
-            // Auto-fit view to model
-            viewer.resetView();
-        } catch (err: any) {
-            console.error("[RL-BIM] Model load failed:", err);
-            status.textContent = `Load error: ${err.message}`;
-        }
+    status.textContent = `Loading model: ${modelUrl}…`;
+    try {
+        const result = await viewer.loadModel(modelUrl);
+        status.textContent = `Model loaded: ${result.elementCount} elements`;
+        console.log("[RL-BIM] Model loaded:", result);
+
+        // Auto-fit view to model
+        await viewer.resetView();
+
+        // Switch to FirstPerson mode
+        viewer.setNavigationMode("FirstPerson");
+    } catch (err: any) {
+        console.error("[RL-BIM] Model load failed:", err);
+        status.textContent = `Load error: ${err.message}`;
     }
 }
 

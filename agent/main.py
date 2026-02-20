@@ -3,6 +3,7 @@ import argparse
 import base64
 import json
 import os
+import shutil
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -12,26 +13,29 @@ from mcp_client import MCPClient
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-SYSTEM_PROMPT = """You are a BIM inspection agent. A 3D IFC model is already loaded.
+# Ensure frames dir exists and is empty initially
+FRAMES_DIR = Path(__file__).parent / "frames"
+if not FRAMES_DIR.exists():
+    FRAMES_DIR.mkdir(parents=True)
+
+SYSTEM_PROMPT = """You are a BIM inspection agent navigating a 3D IFC model. 
 
 TOOLS:
-1. camera_orbit(direction) — orbit left/right/up/down by a small step. Returns a 16-frame sprite sheet.
-2. camera_zoom(direction) — zoom in/out by a small step. Returns a 16-frame sprite sheet.
-3. camera_walk(direction) — walk forward/backward/left/right by 1 meter. Returns a 16-frame sprite sheet.
+1. capture_view() — return the current view (16-frame sprite sheet) without moving. Use this at the very beginning to orient yourself.
+2. camera_look(direction) — pan/tilt the camera head left/right/up/down by a small step. Returns a 16-frame sprite sheet.
+3. camera_walk(direction, steps?) — takes the specified number of 1-meter steps (default 1, max 10) in First-Person Mode. Takes a picture along each step! Returns a 16-frame sprite sheet.
 
 WORKFLOW:
-1. Use the camera tools to navigate around and explore the model.
-2. ALL tools that change the camera will return a single Sprite Sheet image payload.
-   - The image is a 4x4 grid containing the LAST 16 FRAMES of your view.
-   - This provides temporal context (how you got here). Read it left-to-right, top-to-bottom.
-   - The very last (most recent) frame has a RED BORDER.
-3. If your task requires finding something or getting somewhere (like going inside), you MUST keep using the camera tools repeatedly until you get there. You can call tools many times in a row!
+1. First, call `capture_view()` to see where you are.
+2. If the user asks about something INSIDE the building, and you are currently OUTSIDE, you MUST use `camera_walk("forward")` repeatedly to travel through the walls/doors into the building. Do not stop until you are inside!
+3. You can chain as many tool calls as needed to reach your destination. If a step doesn't get you inside, keep walking forward or orbiting.
+4. ALL camera tools return a 4x4 image grid containing the LAST 16 FRAMES of your view. Read left-to-right, top-to-bottom. The very last (most recent) frame has a RED BORDER.
 
 RULES:
-- ONLY take very small steps when using camera tools. Do not try to move in large increments. The tools enforce small steps automatically.
-- Analyze the latest visual information to plan your next movement.
-- NEVER give up or end the task prematurely if you haven't achieved the user's goal. If you need to go inside, keep using camera_walk('forward') over and over again until you are inside.
-- When you have genuinely found the target or completed the goal, ONLY THEN output: "TASK COMPLETE:" + your findings."""
+- ONLY take small steps. 
+- You MUST navigate to the target before you answer. If the prompt asks "what is inside", DO NOT say "I am outside so I don't see anything". Your job is to GO inside first!
+- NEVER give up or end the task prematurely.
+- ONLY output "TASK COMPLETE: [findings]" when you have actually looked at the target area and answered the prompt. Do not output it if you haven't reached the destination yet!"""
 
 
 class BIMAgent:
@@ -43,6 +47,7 @@ class BIMAgent:
         self.mcp = MCPClient()
         self.input_items: list = []
         self.step_count = 0
+        self.frame_counter = 0
 
     async def start(self) -> None:
         await self.mcp.connect()
@@ -102,9 +107,27 @@ class BIMAgent:
             for b in blocks:
                 if b["type"] == "image":
                     mime = b.get("mimeType", "image/png")
+                    img_data = b.get("data", "")
+                    
+                    # Save frame to disk
+                    self.frame_counter += 1
+                    ext = "jpg" if "jpeg" in mime else "png"
+                    frame_path = FRAMES_DIR / f"frame_{self.frame_counter}.{ext}"
+                    try:
+                        with open(frame_path, "wb") as f:
+                            f.write(base64.b64decode(img_data))
+                        
+                        # Cleanup older frames to keep only the last 10
+                        all_frames = sorted(FRAMES_DIR.glob(f"frame_*.*"), key=os.path.getmtime)
+                        while len(all_frames) > 10:
+                            oldest = all_frames.pop(0)
+                            oldest.unlink()
+                    except Exception as e:
+                        print(f"Failed to save frame: {e}")
+
                     parts.append({
                         "type": "input_image",
-                        "image_url": f"data:{mime};base64,{b.get('data', '')}",
+                        "image_url": f"data:{mime};base64,{img_data}",
                         "detail": "auto",
                     })
                 elif b["type"] == "text":

@@ -157,23 +157,30 @@ export class WebSocketAPI {
             (await v.getElementProperties(p.express_id)) || { error: "Not found" });
 
         // Camera tools
-        h.set("camera_orbit", async (p: any) => {
-            // "small" steps are handled by the agent prompt, but we enforce it here by ignoring amount if passed,
-            // or we just trust the prompt to only use 'small'. The viewer method supports amounts.
-            await v.cameraOrbit(p.direction, "small");
-            return await this.shot({ action: "camera_orbit", direction: p.direction });
-        });
-
-        h.set("camera_zoom", async (p: any) => {
-            const dir = p.direction === "in" ? "forward" : "backward";
-            await v.cameraDolly(dir, "small");
-            return await this.shot({ action: "camera_zoom", direction: p.direction });
+        h.set("camera_look", async (p: any) => {
+            // "small" steps are handled by the agent prompt
+            await v.cameraOrbit(p.direction, "small"); // cameraOrbit acts as look around in FirstPerson mode
+            return await this.shot({ action: "camera_look", direction: p.direction });
         });
 
         h.set("camera_walk", async (p: any) => {
-            // By default walk takes 1 step (1 meter)
-            await v.walk(p.direction, 1);
-            return await this.shot({ action: "camera_walk", direction: p.direction });
+            const steps = Math.min(Math.max(p.steps ?? 1, 1), 10);
+            for (let i = 0; i < steps; i++) {
+                await v.walk(p.direction, 1);
+                // Capture an intermediate frame for the history buffer
+                const frame = await v.captureScreenshot(320, 240);
+                this.recentFrames.push(frame);
+                if (this.recentFrames.length > this.maxFrames) {
+                    this.recentFrames.shift();
+                }
+            }
+            // Generate the final sprite sheet containing the new intermediate frames
+            const image = await this.createSpriteSheet();
+            return { action: "camera_walk", direction: p.direction, steps, image };
+        });
+
+        h.set("capture_view", async (p: any) => {
+            return await this.shot({ action: "capture_view" });
         });
     }
 }
