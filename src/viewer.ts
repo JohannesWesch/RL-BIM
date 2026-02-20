@@ -30,6 +30,29 @@ export class BIMViewer {
     private loadedModels: Map<string, FRAGS.FragmentsGroup> = new Map();
     private _originalMaterials: Map<string, THREE.Material | THREE.Material[]> = new Map();
     private _nativeClipPlanes: THREE.Plane[] = [];
+    private _selection: Set<number> = new Set();
+    private _marks: Map<string, { expressId: number; label: string }> = new Map();
+    private _searchCache: Map<string, Array<{ expressId: number; type: string; name: string }>> = new Map();
+    private _searchCounter = 0;
+    private _explodeActive = false;
+    private _ghostActive = false;
+    private _planActive = false;
+    private _activeFloor: {
+        name: string;
+        elevation: number;
+        bbox: THREE.Box3;
+        expressIds: Set<number>;
+    } | null = null;
+    private static readonly EYE_HEIGHT = 1.6;
+
+    static readonly STYLES: Record<string, string> = {
+        primary: "#2196F3",
+        warning: "#FF9800",
+        danger: "#F44336",
+        success: "#4CAF50",
+        info: "#00BCD4",
+        accent: "#ff6b35",
+    };
 
     constructor(container: HTMLElement) {
         this.container = container;
@@ -282,6 +305,612 @@ export class BIMViewer {
     }
 
     // ═══════════════════════════════════════════════════════════
+    // Semantic Camera Motion
+    // ═══════════════════════════════════════════════════════════
+
+    private _modelDiagonal(): number {
+        const bounds = this.getModelBounds();
+        if (!bounds) return 20;
+        const s = bounds.size;
+        return Math.sqrt(s.x * s.x + s.y * s.y + s.z * s.z);
+    }
+
+    private static readonly AMOUNT_FACTORS: Record<string, number> = {
+        small: 0.05, medium: 0.15, large: 0.4,
+    };
+
+    private static readonly ORBIT_DEGREES: Record<string, number> = {
+        small: 15, medium: 45, large: 90,
+    };
+
+    async cameraOrbit(direction: string, amount: string): Promise<void> {
+        const deg = BIMViewer.ORBIT_DEGREES[amount] ?? 45;
+        const az = direction === "left" ? -deg : direction === "right" ? deg : 0;
+        const pol = direction === "up" ? -deg : direction === "down" ? deg : 0;
+        await this.orbitCamera(az, pol);
+    }
+
+    async cameraDolly(direction: string, amount: string): Promise<void> {
+        const dist = this._modelDiagonal() * (BIMViewer.AMOUNT_FACTORS[amount] ?? 0.15);
+        await this.walkForward(direction === "forward" ? dist : -dist);
+    }
+
+    async cameraStrafe(direction: string, amount: string): Promise<void> {
+        const dist = this._modelDiagonal() * (BIMViewer.AMOUNT_FACTORS[amount] ?? 0.15);
+        const dx = direction === "left" ? -dist : dist;
+        await this.panCamera(dx, 0);
+    }
+
+    async cameraRaise(direction: string, amount: string): Promise<void> {
+        const dist = this._modelDiagonal() * (BIMViewer.AMOUNT_FACTORS[amount] ?? 0.15);
+        await this.elevateCamera(direction === "up" ? dist : -dist);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Floor-Locked Walking
+    // ═══════════════════════════════════════════════════════════
+
+    async setActiveFloor(storeyName: string): Promise<{
+        success: boolean;
+        floor?: string;
+        elevation?: number;
+    }> {
+        const storeys = this.getStoreys();
+        const match = storeys.find(s =>
+            s.name.toLowerCase().includes(storeyName.toLowerCase())
+        );
+        if (!match) return { success: false };
+
+        this.isolateStorey(match.name);
+
+        const items = this.getItemsInStorey(match.name);
+        const idSet = new Set(items.expressIds);
+        const box = new THREE.Box3();
+        for (const [, model] of this.loadedModels) {
+            for (const frag of model.items) {
+                for (const id of items.expressIds) {
+                    if (frag.ids.has(id)) box.expandByObject(frag.mesh);
+                }
+            }
+        }
+        if (box.isEmpty()) return { success: false };
+
+        const elevation = box.min.y;
+        this._activeFloor = { name: match.name, elevation, bbox: box, expressIds: idSet };
+
+        const cam = this.world.camera as OBC.OrthoPerspectiveCamera;
+        cam.set("FirstPerson");
+
+        const center = new THREE.Vector3();
+        box.getCenter(center);
+        const startY = elevation + BIMViewer.EYE_HEIGHT;
+        const size = new THREE.Vector3();
+        box.getSize(size);
+        const lookDist = Math.max(size.x, size.z) * 0.1;
+
+        await this.world.camera.controls.setLookAt(
+            center.x, startY, center.z,
+            center.x + lookDist, startY, center.z,
+            true
+        );
+
+        return { success: true, floor: match.name, elevation };
+    }
+
+    private static readonly WALK_STEP = 1; // 1 meter per call
+
+    async walk(direction: string, steps: number = 1): Promise<{
+        success: boolean;
+        stepsTaken: number;
+        stoppedByWall: boolean;
+        stoppedByEdge: boolean;
+    }> {
+        const floor = this._activeFloor;
+        const stepDist = BIMViewer.WALK_STEP;
+        let stoppedByWall = false;
+        let stoppedByEdge = false;
+        let taken = 0;
+
+        for (let i = 0; i < steps; i++) {
+            const pos = new THREE.Vector3();
+            const target = new THREE.Vector3();
+            this.world.camera.controls.getPosition(pos);
+            this.world.camera.controls.getTarget(target);
+
+            const fwd = target.clone().sub(pos);
+            fwd.y = 0;
+            fwd.normalize();
+            const rt = new THREE.Vector3().crossVectors(fwd, new THREE.Vector3(0, 1, 0)).normalize();
+
+            let delta: THREE.Vector3;
+            switch (direction) {
+                case "forward":  delta = fwd.clone().multiplyScalar(stepDist); break;
+                case "backward": delta = fwd.clone().multiplyScalar(-stepDist); break;
+                case "left":     delta = rt.clone().multiplyScalar(-stepDist); break;
+                case "right":    delta = rt.clone().multiplyScalar(stepDist); break;
+                default:         delta = fwd.clone().multiplyScalar(stepDist); break;
+            }
+
+            if (this._checkWallCollision(pos, delta, floor)) {
+                stoppedByWall = true;
+                break;
+            }
+
+            let newPos = pos.clone().add(delta);
+            let newTarget = target.clone().add(delta);
+
+            if (floor) {
+                if (newPos.x < floor.bbox.min.x || newPos.x > floor.bbox.max.x ||
+                    newPos.z < floor.bbox.min.z || newPos.z > floor.bbox.max.z) {
+                    stoppedByEdge = true;
+                    break;
+                }
+                const rayY = this._raycastFloorY(newPos, floor);
+                newPos.y = rayY + BIMViewer.EYE_HEIGHT;
+                const lookDelta = newTarget.clone().sub(newPos);
+                lookDelta.y = 0;
+                newTarget.copy(newPos).add(lookDelta);
+                newTarget.y = newPos.y;
+            }
+
+            await this.world.camera.controls.setLookAt(
+                newPos.x, newPos.y, newPos.z,
+                newTarget.x, newTarget.y, newTarget.z,
+                false
+            );
+            taken++;
+        }
+
+        return { success: taken > 0, stepsTaken: taken, stoppedByWall, stoppedByEdge };
+    }
+
+    private _raycastFloorY(
+        position: THREE.Vector3,
+        floor: { elevation: number; bbox: THREE.Box3; expressIds: Set<number> },
+    ): number {
+        const origin = new THREE.Vector3(position.x, floor.bbox.max.y + 1, position.z);
+        const downRay = new THREE.Raycaster(origin, new THREE.Vector3(0, -1, 0), 0, floor.bbox.max.y - floor.bbox.min.y + 2);
+
+        const meshes: THREE.Object3D[] = [];
+        for (const [, model] of this.loadedModels) {
+            for (const frag of model.items) {
+                let hasFloorId = false;
+                for (const id of frag.ids) {
+                    if (floor.expressIds.has(id)) { hasFloorId = true; break; }
+                }
+                if (hasFloorId) meshes.push(frag.mesh);
+            }
+        }
+
+        const hits = downRay.intersectObjects(meshes, true);
+        if (hits.length > 0) {
+            return hits[0].point.y;
+        }
+        return floor.elevation;
+    }
+
+    private _checkWallCollision(
+        origin: THREE.Vector3,
+        delta: THREE.Vector3,
+        floor: { expressIds: Set<number> } | null,
+    ): boolean {
+        const dir = delta.clone().normalize();
+        const dist = delta.length();
+        if (dist < 0.01) return false;
+
+        const ray = new THREE.Raycaster(origin, dir, 0, dist);
+        const meshes: THREE.Object3D[] = [];
+        for (const [, model] of this.loadedModels) {
+            for (const frag of model.items) {
+                if (floor) {
+                    let belongs = false;
+                    for (const id of frag.ids) {
+                        if (floor.expressIds.has(id)) { belongs = true; break; }
+                    }
+                    if (!belongs) continue;
+                }
+                meshes.push(frag.mesh);
+            }
+        }
+
+        const hits = ray.intersectObjects(meshes, true);
+        return hits.length > 0 && hits[0].distance < dist * 0.8;
+    }
+
+    leaveFloor(): void {
+        this._activeFloor = null;
+        this.showAll();
+        const cam = this.world.camera as OBC.OrthoPerspectiveCamera;
+        cam.set("Orbit");
+    }
+
+    getActiveFloor(): { active: boolean; name?: string; elevation?: number } {
+        if (!this._activeFloor) return { active: false };
+        return { active: true, name: this._activeFloor.name, elevation: this._activeFloor.elevation };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Selection State
+    // ═══════════════════════════════════════════════════════════
+
+    selectElements(expressIds: number[]): { count: number } {
+        for (const id of expressIds) this._selection.add(id);
+        this.highlightElements([...this._selection], BIMViewer.STYLES.primary);
+        return { count: this._selection.size };
+    }
+
+    getSelection(): { expressIds: number[]; count: number } {
+        const expressIds = [...this._selection];
+        return { expressIds, count: expressIds.length };
+    }
+
+    clearSelection(): void {
+        this._selection.clear();
+        this.clearHighlights();
+    }
+
+    async frameSelection(): Promise<{ success: boolean }> {
+        if (this._selection.size === 0) return { success: false };
+        const box = new THREE.Box3();
+        for (const [, model] of this.loadedModels) {
+            for (const frag of model.items) {
+                for (const id of this._selection) {
+                    if (frag.ids.has(id)) {
+                        box.expandByObject(frag.mesh);
+                    }
+                }
+            }
+        }
+        if (box.isEmpty()) return { success: false };
+        await this.world.camera.controls.fitToBox(box, true, { paddingTop: 2, paddingBottom: 2, paddingLeft: 2, paddingRight: 2 });
+        return { success: true };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Persistent Marks
+    // ═══════════════════════════════════════════════════════════
+
+    async markElement(expressId: number, label?: string): Promise<{ markId: string; label: string }> {
+        const markId = `mark-${Date.now()}-${expressId}`;
+        const info = await this.selectElement(expressId);
+        const resolvedLabel = label || info.name || `#${expressId}`;
+        this._marks.set(markId, { expressId, label: resolvedLabel });
+        this.highlightElements([expressId], "danger");
+        await this.focusElement(expressId);
+        return { markId, label: resolvedLabel };
+    }
+
+    listMarks(): Array<{ markId: string; expressId: number; label: string }> {
+        return [...this._marks.entries()].map(([markId, m]) => ({
+            markId, expressId: m.expressId, label: m.label,
+        }));
+    }
+
+    removeMark(markId: string): { success: boolean } {
+        const mark = this._marks.get(markId);
+        if (!mark) return { success: false };
+        this._marks.delete(markId);
+        this.clearHighlights();
+        for (const m of this._marks.values()) {
+            this.highlightElements([m.expressId], "danger");
+        }
+        return { success: true };
+    }
+
+    clearMarks(): void {
+        this._marks.clear();
+        this.clearHighlights();
+    }
+
+    async frameMark(markId: string): Promise<{ success: boolean }> {
+        const mark = this._marks.get(markId);
+        if (!mark) return { success: false };
+        await this.focusElement(mark.expressId);
+        return { success: true };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Search with Caching
+    // ═══════════════════════════════════════════════════════════
+
+    async searchElementsCached(query: string, ifcType?: string): Promise<{
+        searchId: string;
+        results: Array<{ expressId: number; type: string; name: string }>;
+        count: number;
+    }> {
+        const results = await this.searchElements(query, ifcType);
+        const searchId = `search-${++this._searchCounter}`;
+        this._searchCache.set(searchId, results);
+        return { searchId, results, count: results.length };
+    }
+
+    getSearchResults(searchId: string): {
+        results: Array<{ expressId: number; type: string; name: string }>;
+        count: number;
+    } | null {
+        const results = this._searchCache.get(searchId);
+        if (!results) return null;
+        return { results, count: results.length };
+    }
+
+    selectSearchResults(searchId: string, mode: "replace" | "add" = "replace"): { count: number } | null {
+        const results = this._searchCache.get(searchId);
+        if (!results) return null;
+        const ids = results.map(r => r.expressId);
+        if (mode === "replace") {
+            this._selection.clear();
+            this.clearHighlights();
+        }
+        return this.selectElements(ids);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Property Search
+    // ═══════════════════════════════════════════════════════════
+
+    async listPropertyKeys(ifcType?: string, limit: number = 20): Promise<Array<{ key: string; count: number }>> {
+        const keyCounts: Record<string, number> = {};
+        for (const [, model] of this.loadedModels) {
+            const allIDs = model.getAllPropertiesIDs();
+            let scanned = 0;
+            for (const expressId of allIDs) {
+                if (scanned >= 500) break;
+                const prop = await model.getProperties(expressId);
+                if (!prop) continue;
+
+                if (ifcType) {
+                    const typeName = prop.type != null ? this.ifcTypeName(prop.type) : "";
+                    if (!typeName.toLowerCase().includes(ifcType.toLowerCase())) continue;
+                }
+
+                for (const key of Object.keys(prop)) {
+                    if (key === "expressID" || key === "type") continue;
+                    keyCounts[key] = (keyCounts[key] || 0) + 1;
+                }
+                scanned++;
+            }
+        }
+        return Object.entries(keyCounts)
+            .map(([key, count]) => ({ key, count }))
+            .sort((a, b) => b.count - a.count)
+            .slice(0, limit);
+    }
+
+    async searchByProperty(key: string, value: string): Promise<Array<{
+        expressId: number; type: string; name: string; matchedValue: any;
+    }>> {
+        const results: Array<{ expressId: number; type: string; name: string; matchedValue: any }> = [];
+        const valueLower = value.toLowerCase();
+
+        for (const [, model] of this.loadedModels) {
+            const allIDs = model.getAllPropertiesIDs();
+            for (const expressId of allIDs) {
+                const prop = await model.getProperties(expressId);
+                if (!prop) continue;
+
+                const propVal = prop[key];
+                if (propVal === undefined) continue;
+
+                const rawVal = propVal?.value ?? propVal;
+                const strVal = String(rawVal).toLowerCase();
+                if (!strVal.includes(valueLower)) continue;
+
+                const typeName = prop.type != null ? this.ifcTypeName(prop.type) : "";
+                const name = prop.Name?.value ?? `#${expressId}`;
+                results.push({ expressId, type: typeName, name, matchedValue: rawVal });
+                if (results.length >= 100) break;
+            }
+        }
+        return results;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Space Navigation
+    // ═══════════════════════════════════════════════════════════
+
+    async focusSpace(spaceName: string): Promise<{ success: boolean }> {
+        const spatial = this.classifier.list.spatialStructures;
+        if (!spatial) return { success: false };
+        const matchKey = Object.keys(spatial).find(
+            k => k.toLowerCase().includes(spaceName.toLowerCase())
+        );
+        if (!matchKey) return { success: false };
+        const group = spatial[matchKey];
+        const ids = this._extractExpressIds(group.map);
+        if (ids.length === 0) return { success: false };
+
+        const box = new THREE.Box3();
+        for (const [, model] of this.loadedModels) {
+            for (const frag of model.items) {
+                for (const id of ids) {
+                    if (frag.ids.has(id)) box.expandByObject(frag.mesh);
+                }
+            }
+        }
+        if (box.isEmpty()) return { success: false };
+        await this.world.camera.controls.fitToBox(box, true, { paddingTop: 2, paddingBottom: 2, paddingLeft: 2, paddingRight: 2 });
+        return { success: true };
+    }
+
+    isolateSpace(spaceName: string): { success: boolean; isolatedCount: number } {
+        const spatial = this.classifier.list.spatialStructures;
+        if (!spatial) return { success: false, isolatedCount: 0 };
+        const matchKey = Object.keys(spatial).find(
+            k => k.toLowerCase().includes(spaceName.toLowerCase())
+        );
+        if (!matchKey) return { success: false, isolatedCount: 0 };
+        const group = spatial[matchKey];
+        const ids = this._extractExpressIds(group.map);
+        if (ids.length === 0) return { success: false, isolatedCount: 0 };
+        this.isolateElements(ids);
+        return { success: true, isolatedCount: ids.length };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Reset Everything
+    // ═══════════════════════════════════════════════════════════
+
+    async resetScene(): Promise<void> {
+        this.removeAllClipPlanes();
+        this.showAll();
+        this.resetGhost();
+        this.resetExplode();
+        this.clearHighlights();
+        this._selection.clear();
+        this._marks.clear();
+        this._activeFloor = null;
+        this._explodeActive = false;
+        this._ghostActive = false;
+        if (this._planActive) {
+            try { await this.exitPlan(); } catch {}
+            this._planActive = false;
+        }
+        const cam = this.world.camera as OBC.OrthoPerspectiveCamera;
+        cam.set("Orbit");
+        await this.resetView();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Semantic Clipping
+    // ═══════════════════════════════════════════════════════════
+
+    sectionBoxAroundElements(expressIds: number[], margin: "tight" | "medium" | "wide" = "medium"): { success: boolean; planeCount: number } {
+        const box = new THREE.Box3();
+        for (const [, model] of this.loadedModels) {
+            for (const frag of model.items) {
+                for (const id of expressIds) {
+                    if (frag.ids.has(id)) box.expandByObject(frag.mesh);
+                }
+            }
+        }
+        if (box.isEmpty()) return { success: false, planeCount: 0 };
+
+        const pad = { tight: 0.5, medium: 2, wide: 5 }[margin];
+        box.expandByScalar(pad);
+
+        this.removeAllClipPlanes();
+        const center = new THREE.Vector3();
+        const size = new THREE.Vector3();
+        box.getCenter(center);
+        box.getSize(size);
+        this.createClipBox(center.x, center.y, center.z, size.x, size.y, size.z);
+        return { success: true, planeCount: 6 };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Explore Interior (macro)
+    // ═══════════════════════════════════════════════════════════
+
+    async exploreInterior(): Promise<{ success: boolean; strategy: string }> {
+        const storeys = this.getStoreys();
+        if (storeys.length === 0) {
+            this.hideByType("IfcRoof");
+            this.hideByType("IfcSlab");
+            await this.resetView();
+            return { success: true, strategy: "hid_roof_and_slab" };
+        }
+
+        // Pick the storey with the most elements (usually main floor)
+        const target = storeys.reduce((a, b) => a.elementCount > b.elementCount ? a : b);
+        this.isolateStorey(target.name);
+
+        const items = this.getItemsInStorey(target.name);
+        if (items.expressIds.length > 0) {
+            const box = new THREE.Box3();
+            for (const [, model] of this.loadedModels) {
+                for (const frag of model.items) {
+                    for (const id of items.expressIds) {
+                        if (frag.ids.has(id)) box.expandByObject(frag.mesh);
+                    }
+                }
+            }
+            if (!box.isEmpty()) {
+                const center = new THREE.Vector3();
+                box.getCenter(center);
+                const size = new THREE.Vector3();
+                box.getSize(size);
+                const radius = Math.max(size.x, size.z) * 0.3;
+                await this.setCameraPosition(
+                    center.x + radius, center.y + 1.6, center.z + radius,
+                    center.x, center.y + 1.6, center.z,
+                );
+            }
+        }
+        return { success: true, strategy: `isolated_storey:${target.name}` };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Relationship Queries
+    // ═══════════════════════════════════════════════════════════
+
+    getContainingStorey(expressId: number): { storeyName: string | null; storeyId: number | null } {
+        const spatial = this.classifier.list.spatialStructures;
+        if (!spatial) return { storeyName: null, storeyId: null };
+        for (const [name, group] of Object.entries(spatial)) {
+            for (const idSet of Object.values(group.map)) {
+                if (idSet.has(expressId)) {
+                    return { storeyName: name, storeyId: group.id };
+                }
+            }
+        }
+        return { storeyName: null, storeyId: null };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Viewer State
+    // ═══════════════════════════════════════════════════════════
+
+    getViewerState(): {
+        modelsLoaded: number;
+        selectionCount: number;
+        markCount: number;
+        clipPlaneCount: number;
+        sectionActive: boolean;
+        ghostActive: boolean;
+        explodeActive: boolean;
+        planActive: boolean;
+        floorLocked: boolean;
+        activeFloor: string | null;
+        cameraContext: "outside" | "inside" | "unknown";
+        approxHeight: "low" | "eye" | "high";
+        currentMode: string;
+    } {
+        const pos = new THREE.Vector3();
+        this.world.camera.controls.getPosition(pos);
+        const bounds = this.getModelBounds();
+
+        let cameraContext: "outside" | "inside" | "unknown" = "unknown";
+        let approxHeight: "low" | "eye" | "high" = "eye";
+        if (bounds) {
+            const inX = pos.x >= bounds.min.x && pos.x <= bounds.max.x;
+            const inZ = pos.z >= bounds.min.z && pos.z <= bounds.max.z;
+            const inY = pos.y >= bounds.min.y && pos.y <= bounds.max.y;
+            cameraContext = (inX && inZ && inY) ? "inside" : "outside";
+            const relHeight = (pos.y - bounds.min.y) / (bounds.size.y || 1);
+            approxHeight = relHeight < 0.3 ? "low" : relHeight > 0.7 ? "high" : "eye";
+        }
+
+        const cam = this.world.camera as OBC.OrthoPerspectiveCamera;
+        const currentMode = (cam as any).mode?.id ?? "Orbit";
+
+        return {
+            modelsLoaded: this.loadedModels.size,
+            selectionCount: this._selection.size,
+            markCount: this._marks.size,
+            clipPlaneCount: this._nativeClipPlanes.length,
+            sectionActive: this._nativeClipPlanes.length > 0,
+            ghostActive: this._ghostActive,
+            explodeActive: this._explodeActive,
+            planActive: this._planActive,
+            floorLocked: this._activeFloor !== null,
+            activeFloor: this._activeFloor?.name ?? null,
+            cameraContext,
+            approxHeight,
+            currentMode,
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
     // BCF Viewpoints & Topics
     // ═══════════════════════════════════════════════════════════
 
@@ -408,8 +1037,9 @@ export class BIMViewer {
         return null;
     }
 
-    highlightElements(expressIds: number[], color: string = "#ff6b35"): void {
-        const colorObj = new THREE.Color(color);
+    highlightElements(expressIds: number[], colorOrStyle: string = "accent"): void {
+        const hex = BIMViewer.STYLES[colorOrStyle] ?? colorOrStyle;
+        const colorObj = new THREE.Color(hex);
         for (const [, model] of this.loadedModels) {
             for (const frag of model.items) {
                 const matching = expressIds.filter((id) => frag.ids.has(id));
@@ -500,21 +1130,24 @@ export class BIMViewer {
     // ═══════════════════════════════════════════════════════════
 
     async focusElement(expressId: number): Promise<{ found: boolean }> {
+        this.boundingBoxer.reset();
+        let found = false;
         for (const [, model] of this.loadedModels) {
-            for (const frag of model.items) {
-                if (!frag.ids.has(expressId)) continue;
-
-                const mesh = frag.mesh;
-                const box = new THREE.Box3().setFromObject(mesh);
-
-                if (box.isEmpty()) continue;
-
-                const controls = this.world.camera.controls;
-                await controls.fitToBox(box, true, { paddingTop: 2, paddingBottom: 2, paddingLeft: 2, paddingRight: 2 });
-                return { found: true };
+            const fragMap = model.getFragmentMap([expressId]);
+            if (Object.keys(fragMap).length > 0) {
+                this.boundingBoxer.addFragmentIdMap(fragMap);
+                found = true;
             }
         }
-        return { found: false };
+        if (!found) return { found: false };
+
+        const box = this.boundingBoxer.get();
+        if (box.isEmpty()) return { found: false };
+
+        await this.world.camera.controls.fitToBox(box, true, {
+            paddingTop: 2, paddingBottom: 2, paddingLeft: 2, paddingRight: 2,
+        });
+        return { found: true };
     }
 
     getModelBounds(): {
@@ -673,6 +1306,23 @@ export class BIMViewer {
         return tree;
     }
 
+    listElementTypes(): Array<{ type: string; count: number }> {
+        const entities = this.classifier.list.entities;
+        if (!entities) return [];
+        const result: Array<{ type: string; count: number }> = [];
+        for (const [typeName, group] of Object.entries(entities)) {
+            const fragMap = (group as any).map ?? group;
+            let count = 0;
+            for (const idSet of Object.values(fragMap)) {
+                if (idSet && typeof (idSet as any).size === "number") {
+                    count += (idSet as any).size;
+                }
+            }
+            result.push({ type: typeName, count });
+        }
+        return result.sort((a, b) => b.count - a.count);
+    }
+
     // ═══════════════════════════════════════════════════════════
     // Classification-Driven Queries
     // ═══════════════════════════════════════════════════════════
@@ -791,13 +1441,16 @@ export class BIMViewer {
         this.exploder.height = height;
         this.exploder.groupName = "spatialStructures";
         this.exploder.set(true);
+        this._explodeActive = true;
     }
 
     resetExplode(): void {
         this.exploder.set(false);
+        this._explodeActive = false;
     }
 
     ghostAllExcept(expressIds: number[], alpha: number = 0.1): { ghostedMeshes: number } {
+        this._ghostActive = true;
         const keepSet = new Set(expressIds);
         let ghostedMeshes = 0;
 
@@ -844,6 +1497,7 @@ export class BIMViewer {
             }
         }
         this._originalMaterials.clear();
+        this._ghostActive = false;
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -980,11 +1634,13 @@ export class BIMViewer {
         const plan = this.plans.list.find((p) => p.id === planId);
         if (!plan) return { found: false };
         await this.plans.goTo(planId, true);
+        this._planActive = true;
         return { found: true };
     }
 
     async exitPlan(): Promise<void> {
         await this.plans.exitPlanView(true);
+        this._planActive = false;
     }
 
     // ═══════════════════════════════════════════════════════════
