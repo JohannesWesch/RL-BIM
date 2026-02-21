@@ -3,9 +3,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { ViewerBridge } from "./bridge.js";
 
-const server = new McpServer({ name: "rl-bim", version: "4.0.0" });
+const server = new McpServer({ name: "rl-bim", version: "5.0.0" });
 const bridge = new ViewerBridge(3001);
 
+/** Split an image field out of a result into MCP image content. */
 function extractImage(result: any): any[] {
     const { image, ...rest } = result;
     const content: any[] = [{ type: "text" as const, text: JSON.stringify(rest) }];
@@ -32,22 +33,14 @@ function img(result: any) {
     return { content: extractImage(result) };
 }
 
+// ─── Tools ───────────────────────────────────────────────────
+// Register tools here. Example:
+//
+// server.tool("my_tool", "Description",
+//     { param: z.string().describe("A parameter") },
+//     async ({ param }) => text(await bridge.call("my_tool", { param })));
 
-
-server.tool("camera_look", "Pan or tilt the view (turn your head) in a specific direction.",
-    { direction: z.enum(["left", "right", "up", "down"]).describe("Direction to look") },
-    async ({ direction }) => img(await bridge.call("camera_look", { direction })));
-
-server.tool("camera_walk", "Walk the camera by a specific number of steps (1 meter per step) in a given direction (FPS style). Returns a 16-frame sprite sheet of recent views.",
-    {
-        direction: z.enum(["forward", "backward", "left", "right"]).describe("Direction to walk"),
-        steps: z.number().optional().describe("Number of 1-meter steps to walk before returning the image (default: 1, max: 10)")
-    },
-    async ({ direction, steps }) => img(await bridge.call("camera_walk", { direction, steps })));
-
-server.tool("capture_view", "Capture the current view of the model as a sprite sheet without moving the camera.",
-    {},
-    async () => img(await bridge.call("capture_view", {})));
+// ─── Main ────────────────────────────────────────────────────
 
 async function main() {
     await bridge.start();
